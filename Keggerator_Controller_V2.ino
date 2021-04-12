@@ -1,8 +1,6 @@
+#include <PubSubClient.h>
+
 #include <WiFi.h>
-#include <PubSubClient.h>
-
-#include <PubSubClient.h>
-
 #include <strings_en.h>
 #include <WiFiManager.h>
 
@@ -24,9 +22,117 @@ void update_display();
 void u8g2_prepare(void) {
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.setFontRefHeightExtendedText();
+  u8g2.enableUTF8Print();
   u8g2.setDrawColor(1);
   u8g2.setFontPosTop();
   u8g2.setFontDirection(0);
+}
+
+#include "DHTesp.h"
+#include <Ticker.h>
+
+DHTesp dht;
+
+void dht_task(void *pvParameters);
+bool dht_read();
+void trigger_dht_read();
+
+/** Task handle for the light value read task */
+TaskHandle_t dht_task_handle = NULL;
+/** Ticker for temperature reading */
+Ticker dht_ticker;
+/** Flag if task should run */
+bool dht_task_enabled = false;
+/* dht temperature storage */
+float dht_temperature = 0.0;
+float last_sent_dht_temperature = 0.0;
+float dht_humidity = 0.0;
+float last_sent_dht_humidity = 0.0;
+/** Pin number for DHT11 data pin */
+#define DHT_PIN 14
+
+/**
+ * initTemp
+ * Setup DHT library
+ * Setup task and timer for repeated measurement
+ * @return bool
+ *    true if task and timer are started
+ *    false if task or timer couldn't be started
+ */
+bool init_temp() {
+  byte resultValue = 0;
+  // Initialize temperature sensor
+  dht.setup(DHT_PIN, DHTesp::DHT22);
+  Serial.println("DHT initiated");
+
+  // Start task to get temperature
+  xTaskCreatePinnedToCore(
+      dht_task,                       /* Function to implement the task */
+      "dhtTask ",                    /* Name of the task */
+      4000,                           /* Stack size in words */
+      NULL,                           /* Task input parameter */
+      5,                              /* Priority of the task */
+      &dht_task_handle,                /* Task handle. */
+      1);                             /* Core where the task should run */
+
+  if (dht_task_handle == NULL) {
+    Serial.println("Failed to start task for DHT22");
+    return false;
+  } else {
+    // Start update of environment data every 20 seconds
+    dht_ticker.attach(5, trigger_dht_read);
+  }
+  return true;
+}
+
+/**
+ * triggerGetTemp
+ * Sets flag dhtUpdated to true for handling in loop()
+ * called by Ticker getTempTimer
+ */
+void trigger_dht_read() {
+  if (dht_task_handle != NULL) {
+     xTaskResumeFromISR(dht_task_handle);
+  }
+}
+
+/**
+ * Task to reads temperature from DHT11 sensor
+ * @param pvParameters
+ *    pointer to task parameters
+ */
+void dht_task(void *pvParameters) {
+  Serial.println("temp_task loop started");
+  while (1) // tempTask loop
+  {
+    if (dht_task_enabled) {
+      // Get temperature values
+      dht_read();
+    }
+    // Got sleep again
+    vTaskSuspend(NULL);
+  }
+}
+
+/**
+ * getTemperature
+ * Reads temperature from DHT11 sensor
+ * @return bool
+ *    true if temperature could be aquired
+ *    false if aquisition failed
+*/
+bool dht_read() {
+  // Reading temperature for humidity takes about 250 milliseconds!
+  // Sensor readings may also be up to 2 seconds 'old' (it's a very slow sensor)
+  TempAndHumidity newValues = dht.getTempAndHumidity();
+  // Check if any reads failed and exit early (to try again).
+  if (dht.getStatus() != 0) {
+    Serial.println("DHT22 error status: " + String(dht.getStatusString()));
+    return false;
+  }
+
+  dht_temperature = newValues.temperature;
+  dht_humidity = newValues.humidity;
 }
 
 #define DEVICE_NAME "KEGGERATOR"
@@ -117,7 +223,10 @@ boolean mqtt_reconnect() {
   client.setServer(mqtt_settings.mqtt_server, atoi(mqtt_settings.mqtt_port));
   if (client.connect(mqtt_settings.mqtt_name)) {
     // Once connected, publish an announcement...
-    client.publish("test_topic_out","hello world");
+    client.publish("DHT_temperature_c", String(dht_temperature).c_str());
+    last_sent_dht_temperature = dht_temperature;
+    client.publish("DHT_humidity", String(dht_humidity).c_str());
+    last_sent_dht_humidity = dht_humidity;
     // ... and resubscribe
     client.subscribe("test_topic_in");
   }
@@ -147,6 +256,9 @@ void setup() {
     WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP 
     Serial.begin(115200);
     Serial.println("\n Starting");
+
+    init_temp();
+    dht_task_enabled = true;
 
     pinMode(CONFIG_LED, OUTPUT);
     pinMode(CONFIG_BUTTON, INPUT);
@@ -180,7 +292,7 @@ void setup() {
     Serial.print("Setup SSID: ");
     Serial.println(setup_ssid);
 
-    wifi_manager.setConnectTimeout(10);
+    wifi_manager.setConnectTimeout(30);
 
     if(wifi_manager.autoConnect(setup_ssid))
     {
@@ -191,7 +303,6 @@ void setup() {
     {
       Serial.println("Configportal running");
     }
-
 }
 
 void loop() {
@@ -239,6 +350,20 @@ void loop() {
     }
   }
 
+  if(last_sent_dht_temperature != dht_temperature)
+  {
+    Serial.println("Sendint Temp");
+    client.publish("DHT_temperature_c", String(dht_temperature).c_str());
+    last_sent_dht_temperature = dht_temperature;
+  }
+
+  if(last_sent_dht_humidity != dht_humidity)
+  {
+    Serial.println("Sendint Humidity");
+    client.publish("DHT_humidity", String(dht_humidity).c_str());
+    last_sent_dht_humidity = dht_humidity;
+  }
+
   client.loop();
   update_display();
 }
@@ -255,6 +380,12 @@ void update_display()
     u8g2.drawStr( 0, 0, "Network: Connected");
   }
 
-  u8g2.drawStr( 0, 20, last_rx_message);
+  u8g2.drawStr( 0, 10, last_rx_message);
+
+  char str_buffer[256];
+  sprintf(str_buffer, "DHT Temp: %2.2f°C", dht_temperature);
+  u8g2.drawUTF8( 0, 30, str_buffer);
+  sprintf(str_buffer, "Humidity: %2.0f%%", dht_humidity);
+  u8g2.drawUTF8( 0, 40, str_buffer);
   u8g2.sendBuffer();
 }
