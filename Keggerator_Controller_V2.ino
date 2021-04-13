@@ -16,8 +16,12 @@
 #include <Wire.h>
 #endif
 
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/ 15, /* data=*/ 4, /* reset=*/ 16);
-void update_display();
+void draw_booting_display();
+void draw_main_display();
 
 void u8g2_prepare(void) {
   u8g2.setFont(u8g2_font_6x10_tf);
@@ -39,7 +43,7 @@ void trigger_dht_read();
 
 /** Task handle for the light value read task */
 TaskHandle_t dht_task_handle = NULL;
-/** Ticker for temperature reading */
+/** Ticker for dht reading */
 Ticker dht_ticker;
 /** Flag if task should run */
 bool dht_task_enabled = false;
@@ -59,7 +63,7 @@ float last_sent_dht_humidity = 0.0;
  *    true if task and timer are started
  *    false if task or timer couldn't be started
  */
-bool init_temp() {
+bool init_dht22() {
   byte resultValue = 0;
   // Initialize temperature sensor
   dht.setup(DHT_PIN, DHTesp::DHT22);
@@ -134,6 +138,83 @@ bool dht_read() {
   dht_temperature = newValues.temperature;
   dht_humidity = newValues.humidity;
 }
+
+TaskHandle_t ds18b20_task_handle = NULL;
+void ds18b20_task(void *pvParameters);
+bool ds18b20_read();
+void trigger_ds18b20_read();
+bool ds18b20_task_enabled = false;
+float ds18b20_deg_c = 0;
+float last_sent_ds18b20_deg_c = 0;
+Ticker ds18b20_ticker;
+
+#define ONE_WIRE_BUS 27
+
+// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
+OneWire one_wire_bus(ONE_WIRE_BUS);
+// Pass our oneWire reference to Dallas Temperature. 
+DallasTemperature one_wire_sensors(&one_wire_bus);
+// arrays to hold device address
+DeviceAddress ds18b20_device_addr;
+
+bool init_ds18b20()
+{
+  byte resultValue = 0;
+  // Initialize temperature sensor
+  one_wire_sensors.begin();
+  Serial.print("Found ");
+  Serial.print(one_wire_sensors.getDeviceCount(), DEC);
+  Serial.println(" 1-wire devices.");
+  one_wire_sensors.getAddress(ds18b20_device_addr, 0);
+  one_wire_sensors.setResolution(ds18b20_device_addr, 12);
+  Serial.println("DS18B20 initiated");
+
+  // Start task to get temperature
+  xTaskCreatePinnedToCore(
+      ds18b20_task,                       /* Function to implement the task */
+      "ds18b20Task ",                    /* Name of the task */
+      4000,                           /* Stack size in words */
+      NULL,                           /* Task input parameter */
+      5,                              /* Priority of the task */
+      &ds18b20_task_handle,                /* Task handle. */
+      1);                             /* Core where the task should run */
+
+  if (ds18b20_task_handle == NULL) {
+    Serial.println("Failed to start task for ds18b20");
+    return false;
+  } else {
+    // Start update of environment data every 1 seconds
+    ds18b20_ticker.attach(1, trigger_ds18b20_read);
+  }
+  return true;  
+}
+
+void ds18b20_task(void *pvParameters) {
+  Serial.println("ds18b20 loop started");
+  while (1) // tempTask loop
+  {
+    if (ds18b20_task_enabled) {
+      // Get temperature values
+      ds18b20_read();
+    }
+    // Got sleep again
+    vTaskSuspend(NULL);
+  }
+}
+
+bool ds18b20_read()
+{
+  one_wire_sensors.requestTemperatures();
+  ds18b20_deg_c = one_wire_sensors.getTempC(ds18b20_device_addr);
+  return true;
+}
+
+void trigger_ds18b20_read() {
+  if (ds18b20_task_handle != NULL) {
+     xTaskResumeFromISR(ds18b20_task_handle);
+  }
+}
+
 
 #define DEVICE_NAME "KEGGERATOR"
 #define CONFIG_LED 25
@@ -227,6 +308,8 @@ boolean mqtt_reconnect() {
     last_sent_dht_temperature = dht_temperature;
     client.publish("DHT_humidity", String(dht_humidity).c_str());
     last_sent_dht_humidity = dht_humidity;
+    client.publish("DS18B20_temperature_c", String(ds18b20_deg_c).c_str());
+    last_sent_ds18b20_deg_c = ds18b20_deg_c;
     // ... and resubscribe
     client.subscribe("test_topic_in");
   }
@@ -253,12 +336,14 @@ void mqtt_reconnect_wrapper()
 void setup() {
     u8g2.begin();
     u8g2_prepare();
+
+    WiFi.disconnect();
     WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP 
     Serial.begin(115200);
     Serial.println("\n Starting");
 
-    init_temp();
-    dht_task_enabled = true;
+    init_dht22();
+    init_ds18b20();
 
     pinMode(CONFIG_LED, OUTPUT);
     pinMode(CONFIG_BUTTON, INPUT);
@@ -273,11 +358,11 @@ void setup() {
       mqtt_settings = defaults;
     }
 
-    Serial.print("New MQTT Server: ");
+    Serial.print("MQTT Server: ");
     Serial.println(mqtt_settings.mqtt_server);
-    Serial.print("New MQTT Port: ");
+    Serial.print("MQTT Port: ");
     Serial.println(mqtt_settings.mqtt_port);
-    Serial.print("New MQTT Name: ");
+    Serial.print("MQTT Name: ");
     Serial.println(mqtt_settings.mqtt_name);
 
     //wifi_manager.resetSettings();
@@ -287,6 +372,8 @@ void setup() {
     wifi_manager.setConfigPortalBlocking(false);
     wifi_manager.setSaveParamsCallback(saveConfigCallback);
     wifi_manager.setAPCallback(configModeCallback);
+
+    draw_booting_display();
     
     sprintf(setup_ssid, "%s-%s", DEVICE_NAME, String(WIFI_getChipId(),HEX));
     Serial.print("Setup SSID: ");
@@ -303,6 +390,9 @@ void setup() {
     {
       Serial.println("Configportal running");
     }
+
+    dht_task_enabled = true;
+    ds18b20_task_enabled = true;
 }
 
 void loop() {
@@ -352,23 +442,44 @@ void loop() {
 
   if(last_sent_dht_temperature != dht_temperature)
   {
-    Serial.println("Sendint Temp");
     client.publish("DHT_temperature_c", String(dht_temperature).c_str());
     last_sent_dht_temperature = dht_temperature;
   }
 
   if(last_sent_dht_humidity != dht_humidity)
   {
-    Serial.println("Sendint Humidity");
     client.publish("DHT_humidity", String(dht_humidity).c_str());
     last_sent_dht_humidity = dht_humidity;
   }
 
+  if(last_sent_ds18b20_deg_c != ds18b20_deg_c)
+  {
+    Serial.println("Sending Temp");
+    client.publish("DS18B20_temperature_c", String(ds18b20_deg_c).c_str());
+    last_sent_ds18b20_deg_c = ds18b20_deg_c;
+  }
+
   client.loop();
-  update_display();
+  draw_main_display();
 }
 
-void update_display()
+void draw_booting_display()
+{
+  u8g2.clearBuffer();
+
+  u8g2.drawStr(0, 0, "Auto-Connecting...");
+  u8g2.drawStr(0, 10, "Name:");
+  u8g2.drawStr(36, 10, mqtt_settings.mqtt_name);
+
+  u8g2.drawStr(0, 20, "MQTT Server:");
+  u8g2.drawStr(3, 30, mqtt_settings.mqtt_server);
+
+  u8g2.drawStr(0, 40, "Port:");
+  u8g2.drawStr(36, 40, mqtt_settings.mqtt_port);
+  u8g2.sendBuffer();
+}
+
+void draw_main_display()
 {
   u8g2.clearBuffer();
   if(is_config_ui_active)
@@ -380,9 +491,9 @@ void update_display()
     u8g2.drawStr( 0, 0, "Network: Connected");
   }
 
-  u8g2.drawStr( 0, 10, last_rx_message);
-
   char str_buffer[256];
+  sprintf(str_buffer, "Probe Temp: %2.2f°C", ds18b20_deg_c);
+  u8g2.drawUTF8( 0, 20, str_buffer);
   sprintf(str_buffer, "DHT Temp: %2.2f°C", dht_temperature);
   u8g2.drawUTF8( 0, 30, str_buffer);
   sprintf(str_buffer, "Humidity: %2.0f%%", dht_humidity);
