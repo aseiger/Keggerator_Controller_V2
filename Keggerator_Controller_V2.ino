@@ -17,7 +17,7 @@
 #endif
 
 #include <OneWire.h>
-#include <DallasTemperature.h>
+#include <DS18B20.h>
 
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/ 15, /* data=*/ 4, /* reset=*/ 16);
 void draw_booting_display();
@@ -153,21 +153,13 @@ Ticker ds18b20_ticker;
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
 OneWire one_wire_bus(ONE_WIRE_BUS);
 // Pass our oneWire reference to Dallas Temperature. 
-DallasTemperature one_wire_sensors(&one_wire_bus);
-// arrays to hold device address
-DeviceAddress ds18b20_device_addr;
+DS18B20 ds18b20_sensor(&one_wire_bus);
 
 bool init_ds18b20()
 {
   byte resultValue = 0;
   // Initialize temperature sensor
-  one_wire_sensors.begin();
-  Serial.print("Found ");
-  Serial.print(one_wire_sensors.getDeviceCount(), DEC);
-  Serial.println(" 1-wire devices.");
-  one_wire_sensors.getAddress(ds18b20_device_addr, 0);
-  one_wire_sensors.setResolution(ds18b20_device_addr, 12);
-  Serial.println("DS18B20 initiated");
+  ds18b20_sensor.begin();
 
   // Start task to get temperature
   xTaskCreatePinnedToCore(
@@ -204,8 +196,12 @@ void ds18b20_task(void *pvParameters) {
 
 bool ds18b20_read()
 {
-  one_wire_sensors.requestTemperatures();
-  ds18b20_deg_c = one_wire_sensors.getTempC(ds18b20_device_addr);
+  ds18b20_sensor.requestTemperatures();
+  while (!ds18b20_sensor.isConversionComplete())
+  {
+    taskYIELD();
+  }
+  ds18b20_deg_c = ds18b20_sensor.getTempC();
   return true;
 }
 
@@ -304,14 +300,14 @@ boolean mqtt_reconnect() {
   client.setServer(mqtt_settings.mqtt_server, atoi(mqtt_settings.mqtt_port));
   if (client.connect(mqtt_settings.mqtt_name)) {
     // Once connected, publish an announcement...
-    client.publish("DHT_temperature_c", String(dht_temperature).c_str());
+    client.publish("keggeratorv2/DHT_temperature_c", String(dht_temperature).c_str());
     last_sent_dht_temperature = dht_temperature;
-    client.publish("DHT_humidity", String(dht_humidity).c_str());
+    client.publish("keggeratorv2/DHT_humidity", String(dht_humidity).c_str());
     last_sent_dht_humidity = dht_humidity;
-    client.publish("DS18B20_temperature_c", String(ds18b20_deg_c).c_str());
+    client.publish("keggeratorv2/DS18B20_temperature_c", String(ds18b20_deg_c).c_str());
     last_sent_ds18b20_deg_c = ds18b20_deg_c;
     // ... and resubscribe
-    client.subscribe("test_topic_in");
+    client.subscribe("keggeratorv2/test_topic_in");
   }
   return client.connected();
 }
@@ -333,10 +329,13 @@ void mqtt_reconnect_wrapper()
   }  
 }
 
+long last_heartbeat_time;
+long last_display_update_time;
+
 void setup() {
     u8g2.begin();
     u8g2_prepare();
-
+    WiFi.begin();
     WiFi.disconnect();
     WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP 
     Serial.begin(115200);
@@ -393,6 +392,8 @@ void setup() {
 
     dht_task_enabled = true;
     ds18b20_task_enabled = true;
+    last_heartbeat_time = millis();
+    last_display_update_time = millis();
 }
 
 void loop() {
@@ -440,27 +441,53 @@ void loop() {
     }
   }
 
-  if(last_sent_dht_temperature != dht_temperature)
-  {
-    client.publish("DHT_temperature_c", String(dht_temperature).c_str());
-    last_sent_dht_temperature = dht_temperature;
-  }
 
-  if(last_sent_dht_humidity != dht_humidity)
+  if(client.connected())
   {
-    client.publish("DHT_humidity", String(dht_humidity).c_str());
-    last_sent_dht_humidity = dht_humidity;
-  }
+    if(last_sent_dht_temperature != dht_temperature)
+    {
+      Serial.println("Sending DHT Temp");
+      client.publish("keggeratorv2/DHT_temperature_c", String(dht_temperature).c_str());
+      last_sent_dht_temperature = dht_temperature;
+    }
+  
+    if(last_sent_dht_humidity != dht_humidity)
+    {
+      Serial.println("Sending Humidity");
+      client.publish("keggeratorv2/DHT_humidity", String(dht_humidity).c_str());
+      last_sent_dht_humidity = dht_humidity;
+    }
+  
+    if(last_sent_ds18b20_deg_c != ds18b20_deg_c)
+    {
+      Serial.println("Sending Temp");
+      client.publish("keggeratorv2/DS18B20_temperature_c", String(ds18b20_deg_c).c_str());
+      last_sent_ds18b20_deg_c = ds18b20_deg_c;
+    }
 
-  if(last_sent_ds18b20_deg_c != ds18b20_deg_c)
+    if(millis() > (last_heartbeat_time + 10000))
+    {
+      Serial.println("Sending Heartbeat");
+      client.publish("keggeratorv2/heartbeat", "true");
+      last_heartbeat_time = millis();
+    }
+  }
+  else
   {
-    Serial.println("Sending Temp");
-    client.publish("DS18B20_temperature_c", String(ds18b20_deg_c).c_str());
-    last_sent_ds18b20_deg_c = ds18b20_deg_c;
+    Serial.println("Reconnecting to MQTT");
+    if(is_config_ui_active == false)
+    {
+      mqtt_reconnect();
+    }
+  }
+  
+  if(millis() > (last_display_update_time + 250))
+  {
+    draw_main_display();
+    last_display_update_time = millis();
   }
 
   client.loop();
-  draw_main_display();
 }
 
 void draw_booting_display()
@@ -498,5 +525,7 @@ void draw_main_display()
   u8g2.drawUTF8( 0, 30, str_buffer);
   sprintf(str_buffer, "Humidity: %2.0f%%", dht_humidity);
   u8g2.drawUTF8( 0, 40, str_buffer);
+  sprintf(str_buffer, "%d", last_heartbeat_time);
+  u8g2.drawUTF8( 0, 50, str_buffer);
   u8g2.sendBuffer();
 }
